@@ -1,0 +1,75 @@
+{
+  "name": "@uaepass/sdk-ts",
+  "version": "0.1.0",
+  "description": "UAE PASS (uaepass.ae) integration SDK for Node.js & TypeScript — OAuth 2.0 authentication + digital signature, zero runtime deps.",
+  "keywords": [
+    "uae-pass",
+    "uaepass",
+    "oauth2",
+    "pkce",
+    "digital-signature",
+    "esign",
+    "identity",
+    "uae",
+    "dubai",
+    "abu-dhabi"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/MoamenZakaria/uaepass-sdk-ts.git"
+  },
+  "bugs": {
+    "url": "https://github.com/MoamenZakaria/uaepass-sdk-ts/issues"
+  },
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./express": {
+      "types": "./dist/express.d.ts",
+      "import": "./dist/express.js",
+      "require": "./dist/express.cjs"
+    }
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "lint": "tsc -p tsconfig.json --noEmit",
+    "demo": "tsx sample/express-app.ts"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "devDependencies": {
+    "@types/cookie-parser": "^1.4.10",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "@types/supertest": "^6.0.2",
+    "cookie-parser": "^1.4.7",
+    "express": "^4.19.2",
+    "supertest": "^7.0.0",
+    "tsc-alias": "^1.8.10",
+    "tsx": "^4.19.0",
+    "typescript": "^5.4.5",
+    "vitest": "^1.6.0"
+  },
+  "peerDependencies": {
+    "express": ">=4.18"
+  },
+  "peerDependenciesMeta": {
+    "express": {
+      "optional": true
+    }
+  }
+}
