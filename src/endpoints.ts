@@ -17,6 +17,8 @@
 
 export type Environment = "staging" | "production";
 
+import { UaePassConfigurationError } from "./errors.js";
+
 /** Hostname for the desired environment. */
 const HOSTS: Record<Environment, string> = {
   staging: "stg-id.uaepass.ae",
@@ -71,7 +73,7 @@ export function resolveEndpoints(env: Environment): UaePassEndpoints {
 export function parseEnvironment(value: string | undefined): Environment {
   const v = (value ?? "staging").toLowerCase();
   if (v === "staging" || v === "production") return v;
-  throw new Error(
+  throw new UaePassConfigurationError(
     `Unknown UAE PASS environment "${value}". Expected "staging" or "production".`,
   );
 }

@@ -1,36 +1,40 @@
 /**
- * Web-Crypto-based PKCE primitives. Zero dependencies, runtime-portable
- * (Node 18+ and modern browsers).
+ * Web-Crypto-based PKCE primitives + URL-safe encoding helpers.
  *
- *   - `randomUrlSafe`       — uniform sample from the 64-char URL-safe alphabet
- *   - `base64UrlEncode`     — UTF-8 → base64url (no padding)
- *   - `sha256Hex`           — SHA-256 hex helper
+ * Zero dependencies, runtime-portable (Node 18+, Bun, Deno, modern
+ * browsers, React Native with `react-native-get-random-values` polyfill).
+ *
+ *   - `randomUrlSafe`       — uniform sample of `n` chars from the 64-char URL-safe alphabet
+ *   - `base64UrlEncode`     — UTF-8 → base64url (no padding, URL-safe)
+ *   - `base64Encode`        — UTF-8 → standard base64 (no padding)
+ *   - `sha256`, `sha256Hex` — SHA-256 helpers
  *   - `createPkcePair()`    — verifier + S256 challenge
  *
- * Reference: RFC 7636 "Proof Key for Code Exchange".
+ * Reference: RFC 7636 "Proof Key for Code Exchange (PKCE)".
+ *
+ * No `Buffer` references anywhere — base64 is implemented directly on
+ * `Uint8Array` so the module is safe in runtimes that don't expose
+ * Node's Buffer (browsers, React Native).
  */
 
 /**
  * URL-safe alphabet per RFC 3986 §2.3 ("unreserved characters"):
- *
- *   letters, digits, '-', '.', '_', '~'
- *
- * 64 characters total — perfect for rejection-free base64url sampling.
+ * letters, digits, '-', '_'. 64 characters exactly.
  */
 const URL_SAFE_ALPHABET =
   "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
+/** Standard base64 alphabet. */
+const BASE64_ALPHABET = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
 /**
- * Uniformly sample `n` characters from the URL-safe alphabet.
+ * Uniformly sample `n` characters from the 64-char URL-safe alphabet.
  *
- * Implementation note: a naïve `ALPHABET[byte & 63]` introduces a
- * measurable modular bias (small but nonzero for any `n` < ~10^5).
- * We use rejection sampling on a 6-bit slice (`byte & 0x3f` is itself
- * unbiased, but the byte is drawn from a uniform [0, 256) — we accept
- * rejection-free sampling by mapping the top 2 bits away).
- *
- * The cost is one extra byte per ~4 chars; for `n=64` we draw
- * ~80 bytes and discard ~16 — acceptable.
+ * Correctness: each input byte is uniform over `[0, 256)`. Taking the
+ * low 6 bits (`b & 0x3f`) is a bijection onto `[0, 64)` — uniform.
+ * The discarded top 2 bits are independent of the low 6 bits, so we
+ * get **exactly one unbiased alphabet index per byte**, no rejection
+ * sampling needed. This is the cleanest known sampling trick.
  */
 export function randomUrlSafe(charLength = 32): string {
   if (!Number.isInteger(charLength) || charLength < 1 || charLength > 1024) {
@@ -38,46 +42,62 @@ export function randomUrlSafe(charLength = 32): string {
       `randomUrlSafe: charLength must be an integer in [1, 1024]; got ${charLength}.`,
     );
   }
-
   const out: string[] = new Array(charLength);
   let i = 0;
-  // Each byte yields up to ⌊log2(64)/log2(256)·8⌋ ≈ 1.66 chars, but with the
-  // bit-slicing trick below we get exactly 1 char per byte. To be safe we
-  // grab an extra 16 bytes for callers who want > 1000 chars.
-  while (i < charLength) {
-    const bytes = new Uint8Array(charLength + 16);
-    crypto.getRandomValues(bytes);
-    for (let j = 0; j < bytes.length && i < charLength; j++) {
-      const b = bytes[j] ?? 0;
-      // Top 2 bits of every byte are uniform over {0..3}; the low 6 bits
-      // are uniform over {0..63} — exactly the alphabet index.
-      out[i++] = URL_SAFE_ALPHABET[b & 0x3f] as string;
-    }
+  // Each byte yields exactly 1 char; with buffer +16, one fill always suffices.
+  const bytes = new Uint8Array(charLength + 16);
+  crypto.getRandomValues(bytes);
+  for (let j = 0; j < bytes.length && i < charLength; j++) {
+    out[i++] = URL_SAFE_ALPHABET[(bytes[j] ?? 0) & 0x3f] as string;
   }
   return out.join("");
 }
 
-/** UTF-8 string → base64url (no padding, URL-safe). */
-export function base64UrlEncode(input: string | Uint8Array): string {
+/** Standard base64 (no URL-safe substitutions, no padding). */
+export function base64Encode(input: string | Uint8Array): string {
   const bytes =
     typeof input === "string" ? new TextEncoder().encode(input) : input;
-  let bin = "";
-  for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i] ?? 0);
-  const b64 =
-    typeof btoa === "function"
-      ? btoa(bin)
-      : Buffer.from(bin, "binary").toString("base64");
-  return b64.replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  let out = "";
+  const len = bytes.byteLength;
+  for (let i = 0; i < len; i += 3) {
+    const b1 = bytes[i] ?? 0;
+    const b2 = i + 1 < len ? (bytes[i + 1] ?? 0) : 0;
+    const b3 = i + 2 < len ? (bytes[i + 2] ?? 0) : 0;
+    const triplet = (b1 << 16) | (b2 << 8) | b3;
+    out += BASE64_ALPHABET[(triplet >> 18) & 0x3f] as string;
+    out += BASE64_ALPHABET[(triplet >> 12) & 0x3f] as string;
+    out += i + 1 < len ? (BASE64_ALPHABET[(triplet >> 6) & 0x3f] as string) : "=";
+    out += i + 2 < len ? (BASE64_ALPHABET[triplet & 0x3f] as string) : "=";
+  }
+  return out;
 }
 
-/** SHA-256 → hex (uppercase). */
-export async function sha256Hex(input: string): Promise<string> {
-  const data = new TextEncoder().encode(input);
-  const digest = await crypto.subtle.digest("SHA-256", data);
-  return Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, "0"))
-    .join("")
-    .toUpperCase();
+/** UTF-8 → base64url: standard base64, then `+`→`-`, `/`→`_`, strip `=`. */
+export function base64UrlEncode(input: string | Uint8Array): string {
+  return base64Encode(input).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+}
+
+/** SHA-256 → raw bytes (resolves to a 32-byte Uint8Array). */
+export async function sha256(input: string | Uint8Array): Promise<Uint8Array> {
+  const data =
+    typeof input === "string" ? new TextEncoder().encode(input) : input;
+  // `data.buffer` may be `SharedArrayBuffer` in some host configs,
+  // which `crypto.subtle.digest` rejects. Copy into a plain
+  // ArrayBuffer-backed view so we never hit that path.
+  const plain = new Uint8Array(data.byteLength);
+  plain.set(data);
+  const digest = await crypto.subtle.digest("SHA-256", plain);
+  return new Uint8Array(digest);
+}
+
+/** SHA-256 → uppercase hex (66 chars). */
+export async function sha256Hex(input: string | Uint8Array): Promise<string> {
+  const digest = await sha256(input);
+  let hex = "";
+  for (let i = 0; i < digest.byteLength; i++) {
+    hex += (digest[i] ?? 0).toString(16).padStart(2, "0");
+  }
+  return hex.toUpperCase();
 }
 
 /** PKCE pair: code-verifier (43–128 chars) and S256 code-challenge. */
@@ -86,29 +106,24 @@ export async function createPkcePair(verifierLength = 64): Promise<{
   codeChallenge: string;
   codeChallengeMethod: "S256";
 }> {
-  if (verifierLength < 43 || verifierLength > 128) {
+  if (
+    !Number.isInteger(verifierLength) ||
+    verifierLength < 43 ||
+    verifierLength > 128
+  ) {
     throw new RangeError(
-      `PKCE verifier length must be between 43 and 128 chars (got ${verifierLength}).`,
+      `PKCE verifier length must be an integer in [43, 128]; got ${verifierLength}.`,
     );
   }
-  const verifier = randomUrlSafe(verifierLength);
-  const challenge = await base64UrlEncodeFromHash(verifier);
-  return {
-    codeVerifier: verifier,
-    codeChallenge: challenge,
-    codeChallengeMethod: "S256",
-  };
-}
-
-async function base64UrlEncodeFromHash(verifier: string): Promise<string> {
-  const bytes = new TextEncoder().encode(verifier);
-  const digest = await crypto.subtle.digest("SHA-256", bytes);
-  return base64UrlEncode(new Uint8Array(digest));
+  const codeVerifier = randomUrlSafe(verifierLength);
+  const digest = await sha256(codeVerifier);
+  const codeChallenge = base64UrlEncode(digest);
+  return { codeVerifier, codeChallenge, codeChallengeMethod: "S256" };
 }
 
 /**
  * Constant-time string compare, used by state validation.
- * Returns false immediately on length mismatch to avoid wasting cycles.
+ * Returns false immediately on length mismatch (cheap rejection).
  */
 export function safeStringEqual(a: string, b: string): boolean {
   if (a.length !== b.length) return false;

@@ -3,75 +3,78 @@
  *
  * The UAE PASS `idshub` userinfo payload varies by profile:
  *
- *   - Citizen / Resident  → full fields below including `idn`, `idType`
- *   - Visitor            → uses `profileType`, `unifiedID`; no `idn`
+ *   - Citizen/Resident → includes `idn`, `idType`
+ *   - Visitor         → includes `profileType`, `unifiedID`
  *
- * Both inherit `sub`, `uuid` / `spuuid`, `userType`, and `email`.
+ * Both inherit `sub`, `uuid`/`spuuid`, `userType`, and `email`.
+ *
+ * Types are **closed unions** for the well-known fields, but every
+ * object keeps an index signature `[k: string]: unknown` so newly
+ * added provider fields don't break callers.
  */
 
+/** SDK-level SOP account types per UAE PASS docs. */
 export type UserType = "SOP1" | "SOP2" | "SOP3";
 
-/**
- * SOP1 = basic unverified
- * SOP2 = smart-pass / Dubai ID verified (advanced signature only if enabled)
- * SOP3 = fully verified (qualified signature allowed for signing flows)
- */
+/** SOP1 unverified · SOP2 smart-pass · SOP3 fully verified. */
 export interface UaePassBaseProfile {
   /** OIDC subject — stable, opaque. */
   sub: string;
   /** Internal UAE PASS UUID. */
   uuid?: string;
-  /** Service-provider scoped UUID (only when `spuuid` is provisioned). */
+  /** Service-provider-scoped UUID (only when spuuid is provisioned). */
   spuuid?: string;
-  /** Account type — gates which signature flows the user is permitted to perform. */
+  /** Account type — gates which signature flows the user may perform. */
   userType: UserType;
   email?: string;
+  /** Catch-all for newly added provider fields. */
+  [field: string]: unknown;
 }
 
 /**
- * Citizen/Resident profile. UAE PASS always returns these fields when the
- * `urn:uae:digitalid:profile:general` scope is approved — so we model
- * them as required and let integrators narrow their own contract.
+ * Citizen / Resident profile. The well-known required fields are
+ * marked required; everything else is optional. The index signature
+ * keeps the type future-proof.
  */
 export interface UaePassCitizenProfile extends UaePassBaseProfile {
-  /** Emirates ID number (required for verified citizen/resident accounts). */
-  idn: string;
-  /** Document type — typically `"ID"` for Emirates ID. */
-  idType: string;
-  firstnameEN: string;
-  lastnameEN: string;
-  fullnameEN: string;
-  firstnameAR: string;
-  lastnameAR: string;
-  fullnameAR: string;
-  gender: string;
-  mobile: string;
-  nationalityEN: string;
-  nationalityAR: string;
-  /** Authentication Context Class Reference satisfied at login time. */
-  acr?: string;
-  /** Authentication Methods References (array of URN strings). */
-  amr?: readonly string[];
+  /** Emirates ID number. */
+  idn?: string;
+  /** Document type, e.g. `"ID"`. */
+  idType?: string;
+  firstnameEN?: string;
+  lastnameEN?: string;
+  fullnameEN?: string;
+  firstnameAR?: string;
+  lastnameAR?: string;
+  fullnameAR?: string;
+  gender?: string;
+  mobile?: string;
+  nationalityEN?: string;
+  nationalityAR?: string;
   titleEN?: string;
   titleAR?: string;
+  /** Authentication Context Class Reference satisfied at login. */
+  acr?: string;
+  /** Authentication Methods References (array of URNs). */
+  amr?: readonly string[];
 }
 
 /**
  * Visitor profile — returned when the visitor-specific scopes
- * (`...:profileType`, `...:unifiedId`) were requested at /authorize.
+ * (`...:profileType`, `...:unifiedId`) are requested at /authorize.
  */
 export interface UaePassVisitorProfile extends UaePassBaseProfile {
-  profileType: string;
-  unifiedID: string;
-  firstnameEN: string;
-  lastnameEN: string;
-  fullnameEN: string;
-  firstnameAR: string;
-  lastnameAR: string;
-  fullnameAR: string;
-  mobile: string;
-  nationalityEN: string;
-  nationalityAR: string;
+  profileType?: string;
+  unifiedID?: string;
+  firstnameEN?: string;
+  lastnameEN?: string;
+  fullnameEN?: string;
+  firstnameAR?: string;
+  lastnameAR?: string;
+  fullnameAR?: string;
+  mobile?: string;
+  nationalityEN?: string;
+  nationalityAR?: string;
   titleEN?: string;
   titleAR?: string;
   gender?: string;
@@ -80,22 +83,17 @@ export interface UaePassVisitorProfile extends UaePassBaseProfile {
 /** Union returned by `getUserInfo()`. */
 export type UaePassProfile = UaePassCitizenProfile | UaePassVisitorProfile;
 
-/**
- * Narrowing helper — `profile.idn` is the easiest citizen indicator.
- */
-export function isCitizen(
-  p: UaePassProfile,
-): p is UaePassCitizenProfile {
-  return "idn" in p && typeof (p as { idn?: unknown }).idn === "string";
+/** Narrowing helper — `profile.idn` is the easiest citizen indicator. */
+export function isCitizen(p: UaePassProfile): p is UaePassCitizenProfile {
+  return typeof (p as { idn?: unknown }).idn === "string";
 }
 
-/** Narrowing helper for visitor profiles. */
-export function isVisitor(
-  p: UaePassProfile,
-): p is UaePassVisitorProfile {
-  return "unifiedID" in p && typeof (p as { unifiedID?: unknown }).unifiedID === "string";
+/** Narrowing helper — `profile.unifiedID` is the easiest visitor indicator. */
+export function isVisitor(p: UaePassProfile): p is UaePassVisitorProfile {
+  return typeof (p as { unifiedID?: unknown }).unifiedID === "string";
 }
 
+/** OAuth access-token response (RFC 6749 §5.1). */
 export interface AccessTokenResponse {
   access_token: string;
   token_type: "Bearer";
@@ -104,11 +102,16 @@ export interface AccessTokenResponse {
   scope: string;
 }
 
+/** OAuth error response (RFC 6749 §5.2). */
 export interface AccessTokenError {
   error: string;
   error_description?: string;
 }
 
+/**
+ * Authentication Context Class Reference. Selects the strength of
+ * authentication asked of UAE PASS during the /authorize redirect.
+ */
 export type Acr =
   | "urn:safelayer:tws:policies:authentication:level:low"
   | "urn:safelayer:tws:policies:authentication:level:substantial"
@@ -116,17 +119,21 @@ export type Acr =
   | "urn:digitalid:authentication:flow:mobileondevice"
   | `urn:uae:digitalid:authentication:flow:ekyc:${"1" | "2"}`;
 
+/** OAuth scopes accepted by the SDK; include `SIGNATURE_SCOPE` for the sign flow. */
 export type Scope =
-  /** Default profile scope (first/last name, email, mobile, nationality, gender). */
+  /** Default profile scope (name, email, mobile, nationality, gender). */
   | "urn:uae:digitalid:profile:general"
   /** Visitor identifier (profileType). */
   | "urn:uae:digitalid:profile:general:profileType"
   /** Visitor identifier (unifiedId). */
-  | "urn:uae:digitalid:profile:general:unifiedId";
+  | "urn:uae:digitalid:profile:general:unifiedId"
+  /** Required for digital-signature operations. */
+  | "urn:uae:digitalid:signature";
 
-/** Scope required for digital-signature operations. */
-export const SIGNATURE_SCOPE = "urn:uae:digitalid:signature";
+/** Scope required for digital-signature operations (re-exported const). */
+export const SIGNATURE_SCOPE = "urn:uae:digitalid:signature" as const satisfies Scope;
 
+/** TrustedX signing-platform access token. */
 export interface SignatureSigningAccessToken {
   access_token: string;
   token_type: "Bearer";
@@ -135,17 +142,18 @@ export interface SignatureSigningAccessToken {
 }
 
 /**
- * Input to `createSignerProcess`.
+ * Input to `SignatureClient.createSignerProcess`.
  *
- * `document` may be the raw base64 string OR the `{content, name}` shape.
- * The SDK infers a default `name` of `document.pdf` when a string is passed.
+ * `document` accepts either a raw base64 string or the `{content, name}`
+ * shape. Default `name` is `document.pdf` when a string is passed.
  */
 export interface SignatureSignerProcessRequest {
+  /** Base64-encoded PDF bytes. */
   document: { content: string; name: string } | string;
   description?: string;
   reason?: string;
   hashAlgorithm?: "SHA256" | "SHA512";
-  /** Pre-acquired user access token (must include `signature` capability). */
+  /** Pre-acquired user access token (must include the signature scope). */
   userAccessToken: string;
 }
 
@@ -179,20 +187,29 @@ export interface SignatureSignerProcessResult {
 }
 
 /**
- * A small abstraction for persisting login state across the OAuth callback.
+ * Generic persistence contract for the OAuth `state` and PKCE verifier.
  *
- * Generic over the underlying request/response types so the same interface
- * works in Express (`Request`/`Response`), H3 (`H3Event`), Fastify
- * (`FastifyRequest`/`FastifyReply`), or any user-supplied store.
+ * The SDK only needs `{state, codeVerifier}` round-tripped from the
+ * /login handler to the /callback handler — apps wire their own
+ * storage (cookie, JWT, Redis, DB). The interface is generic over the
+ * request/response types so any framework can plug in.
  *
- * The default `cookieSessionStore` returns an `ExpressSessionStore`.
+ * @example
+ * ```ts
+ * // In-memory example — useful for tests
+ * const store: UaePassSessionStore = {
+ *   let buf;
+ *   load: () => buf ?? null,
+ *   save: (_, p) => { buf = p; },
+ *   clear: () => { buf = null; },
+ * };
+ * ```
  */
 export interface UaePassSessionStore<Req = unknown, Res = unknown> {
-  /** Read the persisted state + verifier for the current request, or null. */
+  /** Read persisted state + verifier, or null if none is in flight. */
   load(req: Req): { state: string; verifier: string } | null;
   /** Persist state + verifier for the next callback. */
   save(res: Res, payload: { state: string; verifier: string }): void;
-  /** Clear the persisted state once consumed. */
+  /** Clear persisted state once consumed. */
   clear(res: Res): void;
 }
-

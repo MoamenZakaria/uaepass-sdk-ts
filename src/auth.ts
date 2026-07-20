@@ -1,13 +1,17 @@
 /**
  * OAuth 2.0 authorisation-code + PKCE flow for UAE PASS.
  *
- *   1. `buildAuthorizationUrl()`         → redirects the user to UAE PASS
- *   2. UAE PASS calls the SP's redirect_uri with `?code&state`
+ *   1. `buildAuthorizationUrl()`         → redirect the user to UAE PASS
+ *   2. UAE PASS calls the SP's `redirect_uri` with `?code&state`
  *   3. `exchangeCodeForToken(code, …)`   → access + refresh token
  *   4. `getUserInfo(accessToken)`        → profile
  *
- * For most apps the all-in-one `UaePass.fromEnv()` + `.expressRouter()` is
- * the simplest entry point — see `sample/express-app.ts`.
+ * Designed to be portable — no framework imports. Works in:
+ *
+ *   - Node 18+ (server or CLI)
+ *   - Bun 1+ / Deno 1+
+ *   - Modern browsers / SPAs (via `@uaepass/sdk-ts/browser`)
+ *   - React Native (with `react-native-get-random-values` polyfill)
  *
  * References:
  *   - https://docs.uaepass.ae/feature-guides/authentication/web-application
@@ -17,23 +21,27 @@
 
 import {
   HttpClient,
-  asAccessTokenResponse,
   basicAuthHeader,
   toFormParams,
+  type FetchFn,
 } from "./http.js";
-import type { UaePassSessionStore } from "./types.js";
 import {
   createPkcePair,
   randomUrlSafe,
   safeStringEqual,
+  sha256,
+  base64UrlEncode,
 } from "./crypto.js";
 import {
   resolveEndpoints,
-  parseEnvironment,
   type UaePassEndpoints,
   type Environment,
 } from "./endpoints.js";
-import { UaePassStateError } from "./errors.js";
+import {
+  UaePassConfigurationError,
+  UaePassError,
+  UaePassStateError,
+} from "./errors.js";
 import type {
   AccessTokenResponse,
   Acr,
@@ -42,17 +50,17 @@ import type {
 } from "./types.js";
 
 export interface UaePassClientConfig {
-  /** "staging" or "production". Defaults to `process.env.UAE_PASS_ENV` or "staging". */
+  /** `"staging"` or `"production"`. Defaults to `"staging"`. */
   environment?: Environment;
-  /** OAuth client_id from UAE PASS self-care portal. */
+  /** OAuth `client_id` from the UAE PASS self-care portal. */
   clientId: string;
-  /** OAuth client_secret (confidential clients). */
+  /** OAuth `client_secret` (empty string for public-client PKCE). */
   clientSecret: string;
-  /** Registered redirect_uri exactly as in self-care portal. */
+  /** Registered `redirect_uri` — must match the portal exactly. */
   redirectUri: string;
-  /** Override fetch — used by tests. */
-  fetch?: typeof fetch;
-  /** Override the entire endpoint set (test escape hatch). */
+  /** Override fetch for tests or alternate runtimes. Defaults to global `fetch`. */
+  fetch?: FetchFn;
+  /** Override endpoints (private cloud / mirror deployments). */
   endpoints?: UaePassEndpoints;
 }
 
@@ -63,137 +71,107 @@ export interface AuthorizationRequestInit {
   acrValues?: Acr | Acr[];
   /** UI locale: `en` or `ar`. */
   uiLocales?: "en" | "ar";
-  /** CSRF nonce — must equal the `state` returned on callback. */
+  /** CSRF nonce — must equal `state` returned on callback. Auto-generated if omitted. */
   state?: string;
-  /** PKCE verifier — auto-generated if omitted. */
+  /**
+   * Supply your own PKCE verifier (43–128 URL-safe chars). When
+   * supplied, the matching `code_challenge` is computed automatically —
+   * we **never** generate two independent PKCE pairs in one flow.
+   */
   codeVerifier?: string;
-  /** Pass-through anything else. */
-  extra?: Record<string, string>;
 }
 
 export interface AuthorizationRequestResult {
   /** Absolute URL to redirect the user to. */
   url: string;
-  /** State value — store this and verify on callback. */
+  /** State — store this and verify on callback. */
   state: string;
   /** PKCE code_verifier — store alongside state until callback. */
   codeVerifier: string;
 }
 
-/** Env-var mapping used by `UaePass.fromEnv()`. */
-export interface UaePassEnvConfig {
-  /** @default process.env.UAE_PASS_ENV */
-  environment?: string;
-  /** @default process.env.UAE_PASS_CLIENT_ID */
-  clientId?: string;
-  /** @default process.env.UAE_PASS_CLIENT_SECRET */
-  clientSecret?: string;
-  /** @default process.env.UAE_PASS_REDIRECT_URI */
-  redirectUri?: string;
-}
-
-/**
- * Result returned by `completeLogin()` — the single thing most apps need
- * after the OAuth callback completes.
- */
+/** Result returned by `completeLogin()` — what most apps actually need. */
 export interface CompletedLogin {
+  /** Token to send as `Authorization: Bearer …`. */
   accessToken: string;
+  /** Refresh token, if the provider returned one. */
   refreshToken?: string;
+  /** Absolute expiry timestamp. */
   expiresAt: Date;
+  /** Space-separated scope string the provider granted. */
   scope: string;
+  /** Resolved user profile (citizen or visitor). */
   profile: UaePassProfile;
 }
 
-/** Default set of env vars read by `UaePass.fromEnv()`. */
-export const ENV_KEYS = {
-  environment: "UAE_PASS_ENV",
-  clientId: "UAE_PASS_CLIENT_ID",
-  clientSecret: "UAE_PASS_CLIENT_SECRET",
-  redirectUri: "UAE_PASS_REDIRECT_URI",
-} as const;
-
-// `UaePass` alias is defined at the bottom of this file.
-
-
 /**
- * Main client — every operation routes through `endpoints`.
- * Construct once per process and reuse.
+ * OAuth + signature client for UAE PASS.
  *
- * Quick start:
- *
- *   import { UaePass } from "@uaepass/sdk-ts";
- *   const up = UaePass.fromEnv();
- *   app.use(up.expressRouter({ onLogin: ... }));
+ * Single shared `HttpClient` covers all OAuth endpoints, so the
+ * fetch override you supply at construction time propagates to
+ * every method (token, userinfo, logout, signature).
  */
 export class UaePassClient {
+  /** Public for inspection; do not mutate. */
   readonly endpoints: UaePassEndpoints;
-  private readonly http: HttpClient;
+  private readonly tokenHttp: HttpClient;
+  private readonly userinfoHttp: HttpClient;
+  private readonly logoutHttp: HttpClient;
+  private readonly signHttp: HttpClient;
+  private readonly fetcher: FetchFn;
   private readonly clientId: string;
   private readonly clientSecret: string;
   private readonly redirectUri: string;
 
   constructor(config: UaePassClientConfig) {
-    requireString(config.clientId, "clientId");
-    requireString(config.clientSecret, "clientSecret");
-    requireString(config.redirectUri, "redirectUri");
+    UaePassClient.assertString(config.clientId, "clientId");
+    UaePassClient.assertString(config.clientSecret, "clientSecret");
+    UaePassClient.assertString(config.redirectUri, "redirectUri");
 
     this.clientId = config.clientId;
     this.clientSecret = config.clientSecret;
     this.redirectUri = config.redirectUri;
     this.endpoints =
-      config.endpoints ?? resolveEndpoints(config.environment ?? "staging");
-    this.http = new HttpClient(this.endpoints.token, config.fetch ?? fetch);
+      config.endpoints ??
+      resolveEndpoints(config.environment ?? "staging");
+    this.fetcher = config.fetch ?? defaultFetch();
+    this.tokenHttp = new HttpClient(this.endpoints.token, this.fetcher);
+    this.userinfoHttp = new HttpClient(this.endpoints.userinfo, this.fetcher);
+    this.logoutHttp = new HttpClient(this.endpoints.logout, this.fetcher);
+    this.signHttp = new HttpClient(this.endpoints.signerProcesses, this.fetcher);
   }
 
   /**
-   * Build a client by reading `UAE_PASS_ENV`, `UAE_PASS_CLIENT_ID`,
-   * `UAE_PASS_CLIENT_SECRET`, and `UAE_PASS_REDIRECT_URI` from the
-   * environment (or any overrides you pass).
-   *
-   * The convenience helper keeps the most common case to a single import:
-   *
-   *   import { UaePass } from "@uaepass/sdk-ts";
-   *   const up = UaePass.fromEnv();
+   * Build the absolute /idshub/authorize URL and return the matching
+   * state + code-verifier pair. EXACTLY ONE PKCE pair is generated
+   * per call — if you supply `init.codeVerifier`, we derive the
+   * challenge from it; if you don't, we generate one pair and use
+   * BOTH halves together. This guarantees the verifier the server
+   * binds to is the same one you store for the callback.
    */
-  static fromEnv(env: UaePassEnvConfig = {}): UaePassClient {
-    const pick = <K extends keyof UaePassEnvConfig>(k: K, def: string) => {
-      const v = env[k];
-      return typeof v === "string" && v.length > 0 ? v : def;
-    };
-    const environment = pick("environment", process.env[ENV_KEYS.environment] ?? "");
-    const clientId = pick("clientId", process.env[ENV_KEYS.clientId] ?? "");
-    const clientSecret = pick("clientSecret", process.env[ENV_KEYS.clientSecret] ?? "");
-    const redirectUri = pick("redirectUri", process.env[ENV_KEYS.redirectUri] ?? "");
-    const missing = [
-      ["environment", environment],
-      ["clientId", clientId],
-      ["clientSecret", clientSecret],
-      ["redirectUri", redirectUri],
-    ].filter(([, v]) => !v);
-
-    if (missing.length > 0) {
-      throw new Error(
-        `UaePass.fromEnv: missing required env var(s): ${missing
-          .map(([k]) => `${ENV_KEYS[k as keyof typeof ENV_KEYS]} (${k})`)
-          .join(", ")}.\n` +
-          `Set them in your .env (see .env.example) or pass them explicitly.`,
-      );
-    }
-
-    return new UaePassClient({
-      environment: parseEnvironment(environment),
-      clientId,
-      clientSecret,
-      redirectUri,
-    });
-  }
-
-  /** Build an absolute authorization-endpoint URL + matching state + PKCE pair. */
   async buildAuthorizationUrl(
     init: AuthorizationRequestInit = {},
   ): Promise<AuthorizationRequestResult> {
     const state = init.state ?? randomUrlSafe(24);
-    const verifier = init.codeVerifier ?? (await createPkcePair()).codeVerifier;
+
+    // ONE PKCE pair — never two.
+    let codeVerifier: string;
+    let codeChallenge: string;
+    if (init.codeVerifier !== undefined) {
+      codeVerifier = init.codeVerifier;
+      const digest = await sha256(codeVerifier);
+      codeChallenge = base64UrlEncode(digest);
+    } else {
+      const pair = await createPkcePair();
+      codeVerifier = pair.codeVerifier;
+      codeChallenge = pair.codeChallenge;
+    }
+
+    if (codeVerifier.length < 43 || codeVerifier.length > 128) {
+      throw new UaePassConfigurationError(
+        "PKCE code-verifier must be 43–128 characters (RFC 7636).",
+      );
+    }
 
     const scope = Array.isArray(init.scope)
       ? init.scope.join(" ")
@@ -203,88 +181,70 @@ export class UaePassClient {
       ? init.acrValues.join(" ")
       : init.acrValues ?? "urn:safelayer:tws:policies:authentication:level:low";
 
-    const params = new Map<string, string>([
-      ["response_type", "code"],
-      ["client_id", this.clientId],
-      ["redirect_uri", this.redirectUri],
-      ["scope", scope],
-      ["state", state],
-      ["acr_values", acr],
-    ]);
-    if (init.uiLocales) params.set("ui_locales", init.uiLocales);
-    // PKCE: we always have a verifier (own code path); add the challenge unless caller disabled it.
-    if (!init.codeVerifier || init.extra?.["code_challenge"]) {
-      params.set(
-        "code_challenge",
-        init.extra?.["code_challenge"] ?? (await createPkcePair()).codeChallenge,
-      );
-      params.set("code_challenge_method", "S256");
-    }
-    for (const [k, v] of Object.entries(init.extra ?? {})) {
-      if (!params.has(k)) params.set(k, v);
-    }
+    const params: Record<string, string> = {
+      response_type: "code",
+      client_id: this.clientId,
+      redirect_uri: this.redirectUri,
+      scope,
+      state,
+      acr_values: acr,
+      code_challenge: codeChallenge,
+      code_challenge_method: "S256",
+    };
+    if (init.uiLocales) params["ui_locales"] = init.uiLocales;
 
     const usp = new URLSearchParams();
-    params.forEach((v, k) => usp.set(k, v));
-
+    for (const [k, v] of Object.entries(params)) usp.set(k, v);
     return {
       url: `${this.endpoints.authorize}?${usp.toString()}`,
       state,
-      codeVerifier: verifier,
+      codeVerifier,
     };
   }
 
   /**
-   * Exchange authorisation code for an access token.
-   *
-   * Pass `multipart: true` if the deployment rejects the standard
-   * urlencoded body — UAE PASS docs show `multipart/form-data`, though
-   * urlencoded is universally accepted in practice.
+   * Exchange authorisation `code` for an access token. Pass
+   * `multipart: true` if your deployment rejects the standard
+   * url-encoded body (rare — UAE PASS docs show multipart).
    */
   async exchangeCodeForToken(args: {
     code: string;
     codeVerifier: string;
+    /** Override the `redirect_uri` (must match /authorize). */
     redirectUri?: string;
+    /** Force `multipart/form-data`. Defaults to `application/x-www-form-urlencoded`. */
     multipart?: boolean;
-    /** Abort the call via AbortSignal (e.g. on request cancellation). */
     signal?: AbortSignal;
   }): Promise<AccessTokenResponse> {
-    if (!args.code) throw new Error("exchangeCodeForToken: `code` is required.");
-    if (!args.codeVerifier)
-      throw new Error("exchangeCodeForToken: `codeVerifier` is required.");
+    if (typeof args.code !== "string" || args.code.length === 0) {
+      throw new UaePassConfigurationError("`code` is required.");
+    }
+    if (typeof args.codeVerifier !== "string" || args.codeVerifier.length === 0) {
+      throw new UaePassConfigurationError("`codeVerifier` is required.");
+    }
 
-    const query = toFormParams({
+    const fields = {
       grant_type: "authorization_code",
       code: args.code,
       redirect_uri: args.redirectUri ?? this.redirectUri,
-    });
+    } as const;
 
-    let raw: unknown;
+    const basic = basicAuthHeader(this.clientId, this.clientSecret);
+
     if (args.multipart) {
-      const fd = new FormData();
-      query.forEach((v, k) => fd.set(k, v));
-      const http = new HttpClient(this.endpoints.token, this.fetchOrConfig());
-      raw = await http.request<unknown>({
-        method: "POST",
-        signal: args.signal,
-        basicAuth: basicAuthHeader(this.clientId, this.clientSecret),
-        jsonBody: undefined,
-      });
-      // postForm below
-      raw = await http.postForm<unknown>({
-        grant_type: query.get("grant_type") ?? "authorization_code",
-        code: query.get("code") ?? "",
-        redirect_uri: query.get("redirect_uri") ?? "",
-      });
-    } else {
-      raw = await this.http.request<unknown>({
-        method: "POST",
-        signal: args.signal,
-        formBody: query,
-        basicAuth: basicAuthHeader(this.clientId, this.clientSecret),
-      });
+      // Single multipart POST — no duplicate calls.
+      return this.tokenHttp.postMultipart<AccessTokenResponse>(
+        { ...fields },
+        { signal: args.signal, basicAuth: basic },
+      );
     }
-    return asAccessTokenResponse(raw);
+    const usp = toFormParams(fields);
+    return this.tokenHttp.request<AccessTokenResponse>({
+      method: "POST",
+      signal: args.signal,
+      formBody: usp,
+      basicAuth: basic,
+    });
   }
 
   /** Fetch the authenticated user's profile. */
@@ -292,9 +252,10 @@ export class UaePassClient {
     accessToken: string,
     opts: { signal?: AbortSignal } = {},
   ): Promise<UaePassProfile> {
-    if (!accessToken) throw new Error("getUserInfo: `accessToken` is required.");
-    const http = new HttpClient(this.endpoints.userinfo, this.fetchOrConfig());
-    return http.request<UaePassProfile>({
+    if (typeof accessToken !== "string" || accessToken.length === 0) {
+      throw new UaePassConfigurationError("`accessToken` is required.");
+    }
+    return this.userinfoHttp.request<UaePassProfile>({
       method: "GET",
       signal: opts.signal,
       bearer: accessToken,
@@ -302,24 +263,20 @@ export class UaePassClient {
   }
 
   /**
-   * The single helper that covers ~80% of real apps:
+   * One-call helper for the OAuth callback handler:
    *
-   *   - verifies CSRF state against what was stored before /login
-   *   - exchanges the code for tokens
-   *   - fetches the user profile
+   *   1. CSRF state check
+   *   2. code → tokens
+   *   3. access token → userinfo
    *
-   * Throws `UaePassStateError` on mismatch, OAuth errors otherwise.
+   * Apps are responsible for storing `{state, codeVerifier}` between
+   * their `/login` and `/callback` handlers — pass them back here.
    */
   async completeLogin(args: {
-    /** The `code` query parameter from UAE PASS. */
     code: string;
-    /** The `state` query parameter from UAE PASS. */
     state: string;
-    /** The `state` you stored when calling `buildAuthorizationUrl()`. */
     storedState: string;
-    /** The `codeVerifier` you stored alongside state. */
     storedVerifier: string;
-    /** Abort signal forwarded to fetch. */
     signal?: AbortSignal;
   }): Promise<CompletedLogin> {
     this.verifyState(args.storedState, args.state);
@@ -328,18 +285,22 @@ export class UaePassClient {
       codeVerifier: args.storedVerifier,
       signal: args.signal,
     });
-    const profile = await this.getUserInfo(tokens.access_token, { signal: args.signal });
+    const profile = await this.getUserInfo(tokens.access_token, {
+      signal: args.signal,
+    });
     const expiresAt = new Date(Date.now() + tokens.expires_in * 1000);
     return {
       accessToken: tokens.access_token,
-      ...(tokens.refresh_token ? { refreshToken: tokens.refresh_token } : {}),
+      ...(tokens.refresh_token !== undefined
+        ? { refreshToken: tokens.refresh_token }
+        : {}),
       expiresAt,
       scope: tokens.scope,
       profile,
     };
   }
 
-  /** Build a logout URL — RP-initiated. UAE PASS does not standardise revoke. */
+  /** Build a logout URL (RP-initiated). UAE PASS doesn't standardise revoke. */
   buildLogoutUrl(args: {
     postLogoutRedirectUri?: string;
     idTokenHint?: string;
@@ -354,90 +315,40 @@ export class UaePassClient {
     return qs ? `${this.endpoints.logout}?${qs}` : this.endpoints.logout;
   }
 
-  /** Verify callback `state` against the stored value. Throws on mismatch. */
+  /** CSRF: compare stored state with callback `state`. */
   verifyState(stored: string, received: string): void {
     if (!safeStringEqual(stored, received)) throw new UaePassStateError();
   }
 
-  /** Expose endpoints for use by the signature client. */
+  /** Endpoints object — for advanced callers (e.g. the signature client). */
   getEndpoints(): UaePassEndpoints {
     return this.endpoints;
   }
 
-  /**
-   * Attach the bundled Express router — the recommended default.
-   *
-   *   app.use(up.expressRouter({ onLogin: (req, res, ctx) => { ... } }));
-   *
-   * Returns the router so it can be `.use()`-mounted at a custom path.
-   */
-  expressRouter(opts: ExpressRouterMountOptions): ExpressRouterHandle {
-    if (!opts.onLogin)
-      throw new Error("expressRouter: `onLogin` callback is required.");
-    // The actual router builder lives in `./express.js` to keep the
-    // dependency optional. We import lazily so plain Node consumers
-    // never pay the cost.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports, @typescript-eslint/no-var-requires
-    const mod = require("./express.js") as typeof import("./express.js");
-    const r = mod.createUaePassRouter({
-      client: this,
-      successRedirect: opts.successRedirect ?? "/",
-      failureRedirect: opts.failureRedirect ?? "/",
-      logoutRedirectUri: opts.logoutRedirectUri ?? this.redirectUri,
-      scope: opts.scope,
-      acrValues: opts.acrValues,
-      uiLocales: opts.uiLocales,
-      onLogin: opts.onLogin as Parameters<typeof mod.createUaePassRouter>[0]["onLogin"],
-      onError: opts.onError as Parameters<typeof mod.createUaePassRouter>[0]["onError"],
-      session: opts.session as Parameters<typeof mod.createUaePassRouter>[0]["session"],
-    });
-    return r as unknown as ExpressRouterHandle;
-  }
-
-  private fetchOrConfig(): typeof fetch {
-    // The HttpClient inside this class was constructed with whatever fetch
-    // was passed to the constructor (defaulting to global fetch). For
-    // getUserInfo / exchangeCodeForToken we re-use the same global fetch
-    // when no override was provided; if an override exists, this method
-    // currently can't recover it without a refactor (kept as a private
-    // seam for future tests).
-    return fetch;
+  private static assertString(
+    value: string | undefined,
+    name: string,
+  ): asserts value is string {
+    if (typeof value !== "string" || value.length === 0) {
+      throw new UaePassConfigurationError(
+        `UaePassClient: \`${name}\` is required and must be a non-empty string.`,
+      );
+    }
   }
 }
 
-/** Mirror of the Express helper options — re-declared here to avoid an
- * unconditional Express type import in this file.
- */
-export interface ExpressRouterMountOptions {
-  onLogin: (
-    req: unknown,
-    res: unknown,
-    ctx: { profile: UaePassProfile; tokens: AccessTokenResponse },
-  ) => void | Promise<void>;
-  onError?: (req: unknown, res: unknown, err: unknown) => void;
-  successRedirect?: string;
-  failureRedirect?: string;
-  logoutRedirectUri?: string;
-  scope?: AuthorizationRequestInit["scope"];
-  acrValues?: AuthorizationRequestInit["acrValues"];
-  uiLocales?: AuthorizationRequestInit["uiLocales"];
-  session?: unknown;
-}
-
-/** Marker type for the Express router (duck-typed to a function with `.use()`). */
-export interface ExpressRouterHandle {
-  (req: unknown, res: unknown, next?: unknown): unknown;
-  use?: (...args: unknown[]) => unknown;
-  get?: (...args: unknown[]) => unknown;
-  post?: (...args: unknown[]) => unknown;
-  delete?: (...args: unknown[]) => unknown;
-}
-
-function requireString(value: string | undefined, name: string): asserts value is string {
-  if (!value || value.length === 0) {
-    throw new Error(`UaePassClient: \`${name}\` is required.`);
-  }
-}
-
-/** Public alias used by docs and exported from `index.ts`. */
+/** Public alias. */
 export const UaePass = UaePassClient;
+
+function defaultFetch(): FetchFn {
+  // universal — Node 18+, Bun, Deno, modern browsers all have global fetch.
+  const f = (globalThis as { fetch?: FetchFn }).fetch;
+  if (typeof f !== "function") {
+    throw new UaePassError(
+      "configuration_error",
+      "No `fetch` implementation found in this runtime. Pass `fetch` explicitly " +
+        "to `new UaePassClient({ fetch })` (Node < 18).",
+    );
+  }
+  return f;
+}

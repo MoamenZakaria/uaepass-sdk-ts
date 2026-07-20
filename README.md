@@ -1,43 +1,40 @@
-# @uaepass/sdk-ts
-
-[![npm](https://img.shields.io/npm/v/@uaepass/sdk-ts)](https://www.npmjs.com/package/@uaepass/sdk-ts)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
-[![Coverage](https://img.shields.io/badge/coverage-100%25-brightgreen)](#)
+# `@uaepass/sdk-ts`
 
 > TypeScript SDK for [UAE PASS](https://uaepass.ae) — OAuth 2.0 authentication
-> and digital-signature flows, zero runtime deps, works in Node 18+, Bun, Deno,
-> browsers, and React Native.
+> and digital-signature flows, **zero runtime deps**, no framework lock-in.
 
 - 🔐 **Authentication** — Authorization Code + PKCE, citizen & visitor profiles
-- ✍️ **Digital Signature** — full 6-step trustedx-resources flow
-- 🪶 **Zero runtime deps** — Web Crypto + fetch only
-- 🧩 **Framework-agnostic core** — Express helper available, H3/Fastify ready
-- 🛠 **Typed errors** — `UaePassStateError`, `UaePassOAuthError`, etc.
+- ✍️ **Digital signature** — full 6-step trustedx-resources flow
+- 🪶 **Zero runtime deps** — Web Crypto + global `fetch` only
+- 🧩 **Framework-agnostic core** — works in Express, Fastify, H3, Bun, Deno, browsers, and React Native
+- 🛠 **Typed errors** — `UaePassOAuthError`, `UaePassNetworkError`, `UaePassHttpError`, `UaePassStateError`, `UaePassConfigurationError`
 
 ---
 
 ## Why?
 
 UAE PASS publishes documentation at [docs.uaepass.ae](https://docs.uaepass.ae)
-but every integrator ends up rewriting the same OAuth + PKCE + signature
-plumbing. This SDK gives you a single import that works in:
+but every integrator ends up rewriting the same OAuth + PKCE + signature plumbing.
+This SDK gives you a **single import** that drops into any environment.
 
 | Runtime | Status |
 |---|---|
-| Node 18+ | ✅ tested |
-| Bun 1.0+ | ✅ compatible (uses global `fetch` + `crypto`) |
-| Deno 1.36+ | ✅ compatible (`--unstable-bytes` not needed) |
-| Browsers / React Native | ✅ compatible — `Buffer` calls are gated |
+| Node 18+ (server) | ✅ tested, 51 tests pass |
+| Bun 1+ | ✅ same as Node (uses global `fetch` + `crypto`) |
+| Deno 1.36+ | ✅ same as Node |
+| Browsers / SPA | ✅ bundler-friendly, no Buffer/Node imports |
+| React Native | ⚠️ requires `react-native-get-random-values` polyfill for `crypto.getRandomValues` |
 
 ---
 
-## 1. Install
+## Install
 
 ```bash
 npm install @uaepass/sdk-ts
 ```
 
-Add the SDK credentials to your `.env` (sandbox values from the docs):
+Add credentials from the [UAE PASS Self-Care Portal](https://uaepass.ae) →
+Developers → register your app:
 
 ```env
 UAE_PASS_ENV=staging
@@ -48,105 +45,98 @@ UAE_PASS_REDIRECT_URI=http://localhost:3000/callback
 
 ---
 
-## 2. Five-minute integration
+## 5-minute integration (any framework)
 
-### Server-side (Express, Fastify, H3, …)
-
-The cleanest path. SDK does OAuth + PKCE + state persistence in a signed cookie
-— no session middleware needed.
-
-```ts
-import express from "express";
-import cookieParser from "cookie-parser";
-import { UaePass } from "@uaepass/sdk-ts";
-
-const app = express();
-app.use(cookieParser());
-
-const up = UaePass.fromEnv();   // reads the 4 UAE_PASS_* env vars
-
-app.use(
-  up.expressRouter({
-    onLogin: async (req, res, { profile, tokens }) => {
-      // `tokens.access_token` is your session. Persist `profile` to your DB.
-      req.session.userId = profile.sub;
-      req.session.accessToken = tokens.access_token;
-    },
-    successRedirect: "/dashboard",
-    failureRedirect: "/login?error=uaepass",
-  }),
-);
-
-app.listen(3000);
-```
-
-Get credentials in the [Self-Care Portal](https://uaepass.ae) → Developers →
-register your app → copy the `client_id` / `client_secret` and match the
-`redirect_uri` **exactly** to what you put in the dev portal.
-
-### Mobile (iOS / Android deep-link)
-
-UAE PASS exposes an app-to-app flow when the user has the UAE PASS app
-installed (see the [Mobile Integration Guide](https://docs.uaepass.ae/feature-guides/authentication/mobile-application/guide/api)).
-The SDK builds the launch URL and handles the redirect's `code`:
+### 1. Build the auth URL + store the PKCE pair
 
 ```ts
 import { UaePassClient } from "@uaepass/sdk-ts";
 
 const up = new UaePassClient({
-  environment: "production",
-  clientId: "mobile-client-id",
-  clientSecret: "mobile-client-secret",
-  redirectUri: "myapp://callback",     // matches your Info.plist / deep-link
+  environment: "staging",                 // or "production"
+  clientId: process.env.UAE_PASS_CLIENT_ID!,
+  clientSecret: process.env.UAE_PASS_CLIENT_SECRET!,
+  redirectUri: process.env.UAE_PASS_REDIRECT_URI!,
 });
 
-const { url } = await up.buildAuthorizationUrl({
-  // On-device flow when the UAE PASS app is installed:
-  acrValues: "urn:digitalid:authentication:flow:mobileondevice",
-  scope: ["urn:uae:digitalid:profile:general"],
-});
-
-// `url` → open in app, or copy into a WebView for fallback.
-// Later, on redirect:
-const result = await up.completeLogin({
-  code:        "received-from-url",
-  state:       "received-from-url",
-  storedState:        previouslyStoredState,
-  storedVerifier:     previouslyStoredVerifier,
-});
+// In your "/login" handler — start the round-trip
+const { url, state, codeVerifier } = await up.buildAuthorizationUrl();
+// → Save `state` + `codeVerifier` somewhere so /callback can find them:
+//   cookie (signed), Redis, JWT, DB, anywhere.
+// → Redirect the user to `url`.
 ```
 
-### Browser SPA (no server)
+### 2. Complete the login in `/callback`
 
-If you're a SPA with no backend, do the token exchange from a thin backend or
-proxy endpoint (you cannot expose `client_secret` to the browser).
+```ts
+// In your "/callback" handler — finish the round-trip
+const login = await up.completeLogin({
+  code: req.query.code as string,
+  state: req.query.state as string,
+  storedState:    previouslySavedState,
+  storedVerifier: previouslySavedCodeVerifier,
+});
+
+// `login` shape:
+// {
+//   accessToken:    "67f2…",
+//   refreshToken?:  "…",
+//   expiresAt:      Date,
+//   scope:          "urn:uae:digitalid:profile:general",
+//   profile:        { sub, uuid, userType, idn, … },
+// }
+```
+
+> That's the whole OAuth flow. The SDK does **not** pick a framework, a session
+> store, or a cookie library — those are yours. If you're on Node, the
+> `@uaepass/sdk-ts/node` entry exposes a `fromEnv()` convenience:
+
+```ts
+import { fromEnv } from "@uaepass/sdk-ts/node";
+const up = fromEnv();
+```
+
+### 3. Runnable demo — `node:http` (zero framework)
+
+```bash
+cp .env.example .env            # fill in the 4 UAE_PASS_* values
+npm run demo                    # tsx examples/node-http-server.ts
+# Open http://localhost:3000/login
+```
+
+### 4. Framework adapters
+
+Stay tuned — Express, H3, Fastify adapters live as **separate packages**
+that depend on this one. Don't bloat your `dependencies` with a framework
+just to use this SDK.
 
 ---
 
-## 3. Digital signature
-
-The full single-document signing flow:
+## Digital signature (single-document flow)
 
 ```ts
 import { SignatureClient } from "@uaepass/sdk-ts";
 
 const sig = new SignatureClient({
   environment: "production",
-  clientId, clientSecret,
+  clientId,
+  clientSecret,
 });
 
-// 2. Get signing-platform token (client_credentials grant).
+// 1. User authenticates FIRST via /idshub/authorize → `accessToken`
+//    with the signature scope (urn:uae:digitalid:signature).
+// 2. Get a signing-platform token (client_credentials).
 await sig.getToken();
 
 // 3. Kick off the signing process.
 const { signerProcessId, documentId } = await sig.createSignerProcess({
   document: { content: base64Pdf, name: "contract.pdf" },
-  userAccessToken,         // token from /idshub/token, must include signature scope
+  userAccessToken,                     // token from /idshub/token
   description: "Sign at your convenience",
   reason: "approval",
 });
 
-// 4. Poll until terminal.
+// 4. Poll until terminal (COMPLETED / FAILED / EXPIRED).
 const result = await sig.waitUntilDone(signerProcessId, {
   intervalMs: 2_000,
   timeoutMs:  5 * 60_000,
@@ -155,8 +145,8 @@ const result = await sig.waitUntilDone(signerProcessId, {
 // 5. Download the signed PDF.
 if (result.status === "COMPLETED") {
   for (const { id } of result.signedDocuments ?? []) {
-    const pdf = await sig.fetchSignedDocument(id);
-    await fs.promises.writeFile(`signed-${id}.pdf`, pdf);
+    const bytes = await sig.fetchSignedDocument(id);
+    await fs.promises.writeFile(`signed-${id}.pdf`, bytes);
   }
 }
 
@@ -166,9 +156,9 @@ await sig.deleteProcess(signerProcessId);
 
 ---
 
-## 4. Error handling
+## Error handling
 
-All errors extend `UaePassError` so you can branch on `instanceof`:
+All errors extend `UaePassError`. Branch on `instanceof`:
 
 ```ts
 import {
@@ -177,75 +167,88 @@ import {
   UaePassNetworkError,
   UaePassStateError,
   UaePassHttpError,
+  UaePassConfigurationError,
+  isUaePassError,
 } from "@uaepass/sdk-ts";
 
 try {
   await up.exchangeCodeForToken({ code, codeVerifier });
 } catch (err) {
   if (err instanceof UaePassOAuthError) {
-    console.warn("OAuth rejected:", err.code, err.description);
+    // err.code is one of: invalid_request, invalid_grant, ...
+    logger.warn("OAuth rejected", { code: err.code, description: err.description });
   } else if (err instanceof UaePassStateError) {
-    console.warn("Possible CSRF — state mismatch");
+    logger.warn("CSRF state mismatch");
   } else if (err instanceof UaePassNetworkError) {
-    console.warn("Network blip — retry?");
+    // Retry? Backoff?
   } else if (err instanceof UaePassHttpError) {
-    console.error("UAE PASS answered", err.status, err.bodyText);
-  } else if (err instanceof UaePassError) {
-    console.error("Other SDK error", err.code);
-  } else throw err;
+    logger.error("Upstream answered", { status: err.status, body: err.bodyText });
+  } else if (err instanceof UaePassConfigurationError) {
+    // Programming error — fix your config
+    throw err;
+  } else if (isUaePassError(err)) {
+    throw err;
+  } else {
+    throw err; // unknown — re-throw
+  }
 }
 ```
 
 ---
 
-## 5. API reference
+## API reference
 
 ### `UaePassClient` / `UaePass`
 
-| Method | Purpose |
-|---|---|
-| `UaePass.fromEnv()` | Factory — reads `UAE_PASS_*` env vars |
-| `new UaePassClient(cfg)` | Manual construction |
-| `buildAuthorizationUrl(init?)` | Build the URL & PKCE pair for /idshub/authorize |
-| `exchangeCodeForToken(args)` | `code` → `access_token` (multipart or urlencoded) |
-| `getUserInfo(token, opts?)` | Fetch the user's profile (citizen or visitor) |
-| `completeLogin(args)` | One-call: verify state + exchange + userinfo |
-| `buildLogoutUrl(args?)` | RP-initiated logout URL |
-| `verifyState(stored, received)` | Constant-time-safe state check |
-| `expressRouter(opts)` | Returns a ready-to-mount Express router |
+| Method | Returns | Purpose |
+|---|---|---|
+| `new UaePassClient(cfg)` | client | Manual construction (any runtime) |
+| `buildAuthorizationUrl(init?)` | `{ url, state, codeVerifier }` | Build /idshub/authorize URL + PKCE pair |
+| `exchangeCodeForToken(args)` | `AccessTokenResponse` | `code` → `access_token` |
+| `getUserInfo(token, opts?)` | `UaePassProfile` | Fetch profile (citizen or visitor) |
+| `completeLogin(args)` | `{ accessToken, refreshToken?, expiresAt, scope, profile }` | All-in-one: state-verify + token + userinfo |
+| `buildLogoutUrl(args?)` | `string` | RP-initiated logout URL |
+| `verifyState(stored, received)` | `void` (throws `UaePassStateError` on mismatch) | Constant-time-safe state compare |
+| `getEndpoints()` | `UaePassEndpoints` | Resolved URLs for advanced callers |
 
 ### `SignatureClient`
 
-| Method | Purpose |
-|---|---|
-| `getToken(scope?)` | OAuth client_credentials → signing token (cached) |
-| `invalidateToken()` | Force-refresh on next call |
-| `createSignerProcess(opts)` | Upload the PDF + create the signing process |
-| `getResult(processId)` | One-shot status check |
-| `waitUntilDone(processId, opts?)` | Polls until `COMPLETED` / `FAILED` / `EXPIRED` |
-| `fetchSignedDocument(documentId)` | Stream raw signed PDF as `Uint8Array` |
-| `deleteProcess(processId)` | Cleanup the signing process |
+| Method | Returns | Purpose |
+|---|---|---|
+| `getToken(scope?)` | `SignatureSigningAccessToken` | Signing-platform token (cached by `expires_in`) |
+| `invalidateToken()` | `void` | Force-refresh on next call |
+| `createSignerProcess(opts)` | `{ documentId, signerProcessId }` | Upload the PDF + create the signing process |
+| `getResult(processId)` | `SignatureSignerProcessResult` | One-shot status check |
+| `waitUntilDone(processId, opts?)` | `SignatureSignerProcessResult` | Polls until `COMPLETED` / `FAILED` / `EXPIRED` |
+| `fetchSignedDocument(documentId)` | `Uint8Array` | Raw signed PDF as bytes |
+| `deleteProcess(processId)` | `void` | Clean up the signing process |
 
 ### Types
 
 `UaePassCitizenProfile`, `UaePassVisitorProfile`, `UaePassProfile`,
-`AccessTokenResponse`, `SignatureSignerProcessResult`, etc. — all exported
-and re-exported from the package root.
+`AccessTokenResponse`, `SignatureSignerProcessResult`, `UaePassSessionStore<Req,Res>`,
+`HttpClient`, `FetchFn`, etc. — all exported from the package root.
+
+### Identity helpers
+
+- `isCitizen(profile)` — type guard narrowing to `UaePassCitizenProfile`
+- `isVisitor(profile)` — type guard narrowing to `UaePassVisitorProfile`
+- `isUaePassError(err)` — type guard narrowing to `UaePassError`
 
 ---
 
-## 6. Configuration reference
+## Configuration
 
 ### `UaePassClientConfig`
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `environment` | `"staging" \| "production"` | `"staging"` | |
-| `clientId` | `string` | — | |
-| `clientSecret` | `string` | — | Use **public-client PKCE** (`clientSecret=""`) if your app is configured as a public client in the Self-Care portal. |
-| `redirectUri` | `string` | — | Must match the portal **exactly**. |
-| `fetch` | `typeof fetch` | `globalThis.fetch` | Override for tests. |
-| `endpoints` | `UaePassEndpoints` | resolved via `environment` | Custom hosts (private-cloud). |
+| `environment` | `"staging" \| "production"` | `"staging"` | Endpoint host selection |
+| `clientId` | `string` | — | From the Self-Care Portal |
+| `clientSecret` | `string` | — | Use **empty string** for public-client PKCE |
+| `redirectUri` | `string` | — | Must match the portal exactly |
+| `fetch` | `FetchFn` | `globalThis.fetch` | Override for tests / non-standard runtimes |
+| `endpoints` | `UaePassEndpoints` | resolved via `environment` | Private cloud / mirror deployments |
 
 ### `SignatureClientConfig`
 
@@ -253,15 +256,16 @@ Same shape, plus:
 
 | Field | Type | Default | Notes |
 |---|---|---|---|
-| `hashAlgorithm` | `"SHA256" \| "SHA512"` | `"SHA256"` | Per-document hash. |
+| `hashAlgorithm` | `"SHA256" \| "SHA512"` | `"SHA256"` | Per-document hash |
+| `expirySafetyMs` | `number` | `60_000` | Refresh the signing token this many ms **before** `expires_in` |
 
 ---
 
-## 7. Scope & ACR reference
+## Scope & ACR reference
 
 | Scope | Use |
 |---|---|
-| `urn:uae:digitalid:profile:general` | Citizen/Resident: name, email, mobile, gender, nationality |
+| `urn:uae:digitalid:profile:general` | Citizen/Resident: name, email, mobile, nationality, gender |
 | `urn:uae:digitalid:profile:general:profileType` | Visitor: profile type |
 | `urn:uae:digitalid:profile:general:unifiedId` | Visitor: unified ID |
 | `urn:uae:digitalid:signature` | Required for digital-signature operations |
@@ -275,30 +279,30 @@ Same shape, plus:
 
 ---
 
-## 8. Running locally
+## Develop locally
 
 ```bash
 git clone https://github.com/MoamenZakaria/uaepass-sdk-ts.git
 cd uaepass-sdk-ts
 npm install
-npm test          # vitest run (3 files, 26 tests)
+npm test          # 51 tests, vitest run
 npm run lint      # tsc --noEmit
 npm run build     # tsc → dist/
-npm run demo      # tsx sample/express-app.ts
+npm run demo      # tsx examples/node-http-server.ts
 ```
 
 ---
 
-## 9. Roadmap
+## Roadmap
 
-- [ ] H3 / Nuxt adapter
-- [ ] Fastify adapter
+- [ ] H3 / Nuxt adapter (separate package)
+- [ ] Fastify adapter (separate package)
 - [ ] Multi-document signing flow
 - [ ] e-Seal flow
 - [ ] Data-sharing authorization flow
 
 ---
 
-## 10. License
+## License
 
 MIT © 2026 [Moamen Zakaria](https://github.com/MoamenZakaria)

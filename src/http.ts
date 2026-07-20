@@ -1,12 +1,18 @@
 /**
  * Tiny, dependency-free `fetch`-based HTTP helper.
  *
- * Why a wrapper?
- *   - Uniform error mapping (network vs. HTTP vs. OAuth protocol error).
- *   - Centralised JSON/form handling — UAE PASS token endpoint uses
- *     `application/x-www-form-urlencoded` per RFC 6749 §4.1.3, which is
- *     awkward to hand-roll with bare `fetch`.
- *   - Testability — callers can inject a `fetch` mock via config.
+ * `HttpClient` knows its base URL, the fetch implementation, and owns
+ * all error mapping. Two methods cover nearly every use:
+ *
+ *   - `request`      → JSON-parsed response body, throws typed errors
+ *   - `requestRaw`   → `Response` object for callers needing raw bytes
+ *                       (signed PDF downloads). Throws only on network failures.
+ *
+ * Why a class instead of free functions?
+ *   - One fetch injection point — every method uses the constructor-injected fetch
+ *   - No duplicate body reads (`response.json()` consumes the body)
+ *   - All non-2xx responses become typed `UaePassError` subclasses
+ *   - Cancellation via `AbortSignal` is honoured in both code paths
  */
 
 import {
@@ -26,23 +32,154 @@ export type FetchFn = (
 export interface HttpRequestOptions {
   method?: "GET" | "POST" | "DELETE";
   query?: Record<string, string | undefined>;
-  /** Pre-formatted URLSearchParams body (preferred for token calls). */
+  /** Pre-formatted URLSearchParams body — sets `application/x-www-form-urlencoded`. */
   formBody?: URLSearchParams;
   /** JSON body — sets `Content-Type: application/json`. */
   jsonBody?: unknown;
+  /** `multipart/form-data` body. The string value is the field name (e.g. "code"). */
+  multipart?: Record<string, string>;
   headers?: Record<string, string>;
   /** Abort signal forwarded to fetch. */
   signal?: AbortSignal;
   /** Bearer token to send as `Authorization: Bearer <token>`. */
   bearer?: string;
-  /** Basic auth header value (token endpoint). */
+  /** Pre-encoded `Basic …` header value (token endpoint). */
   basicAuth?: string;
 }
 
-/**
- * Build a URL with optional query string from a base URL and a flat object.
- */
-export function buildUrl(
+export class HttpClient {
+  /** Read-only — exposed for callers that want to construct companion clients. */
+  public readonly fetchFn: FetchFn;
+
+  constructor(
+    public readonly baseUrl: string,
+    fetchFn?: FetchFn,
+  ) {
+    this.fetchFn = fetchFn ?? (globalThis.fetch as FetchFn | undefined) ?? fetch;
+  }
+
+  /** JSON body. Throws on any non-2xx or network error. */
+  async request<T = unknown>(opts: HttpRequestOptions = {}): Promise<T> {
+    const res = await this.send(opts);
+    await this.assertNotError(res);
+    if (res.status === 204) return undefined as T;
+    const ct = (res.headers.get("content-type") ?? "").toLowerCase();
+    if (ct.includes("application/json") || ct.includes("+json")) {
+      return (await readJsonOrThrow(res, this.baseUrl)) as T;
+    }
+    // Non-JSON 2xx — return as text. Caller decides how to coerce.
+    return (await res.text()) as unknown as T;
+  }
+
+  /** Raw `Response`. Throws only on network failures. Caller inspects status. */
+  async requestRaw(opts: HttpRequestOptions = {}): Promise<Response> {
+    return this.send(opts);
+  }
+
+  /** Raw `Uint8Array` body. Throws on any non-2xx or network error. */
+  async requestBytes(opts: HttpRequestOptions = {}): Promise<Uint8Array> {
+    const res = await this.send(opts);
+    await this.assertNotError(res);
+    if (res.status === 204) return new Uint8Array(0);
+    return new Uint8Array(await res.arrayBuffer());
+  }
+
+  /**
+   * `multipart/form-data` POST. The UAE PASS docs show the token
+   * endpoint accepting this format; in practice url-encoded works too,
+   * but the option exists for deployments that require it.
+   */
+  async postMultipart<T = unknown>(
+    fields: Record<string, string>,
+    opts: Omit<HttpRequestOptions, "formBody" | "jsonBody"> = {},
+  ): Promise<T> {
+    const fd = new FormData();
+    for (const [k, v] of Object.entries(fields)) fd.set(k, v);
+    const init = this.buildInit({
+      ...opts,
+      method: "POST",
+    });
+    init.body = fd as unknown as BodyInit;
+    let res: Response;
+    try {
+      res = await this.fetchFn(this.baseUrl, init);
+    } catch (err) {
+      throw new UaePassNetworkError(
+        `Network request to ${this.baseUrl} failed: ${errMessage(err)}`,
+        err,
+      );
+    }
+    await this.assertNotError(res);
+    if (res.status === 204) return undefined as T;
+    const ct = (res.headers.get("content-type") ?? "").toLowerCase();
+    if (ct.includes("application/json") || ct.includes("+json")) {
+      return (await res.json()) as T;
+    }
+    return (await res.text()) as unknown as T;
+  }
+
+  // ─────────── internals ───────────
+
+  private async send(opts: HttpRequestOptions): Promise<Response> {
+    const init = this.buildInit(opts);
+    const url = appendQuery(this.baseUrl, opts.query);
+    try {
+      return await this.fetchFn(url, init);
+    } catch (err) {
+      throw new UaePassNetworkError(
+        `Network request to ${url} failed: ${errMessage(err)}`,
+        err,
+      );
+    }
+  }
+
+  private buildInit(opts: HttpRequestOptions): RequestInit {
+    const headers: Record<string, string> = { ...(opts.headers ?? {}) };
+    if (opts.bearer) headers["Authorization"] = `Bearer ${opts.bearer}`;
+    if (opts.basicAuth) headers["Authorization"] = `Basic ${opts.basicAuth}`;
+
+    const init: RequestInit = { method: opts.method ?? "GET", headers };
+    if (opts.signal) init.signal = opts.signal;
+    if (opts.formBody) {
+      headers["Content-Type"] =
+        "application/x-www-form-urlencoded; charset=UTF-8";
+      init.body = opts.formBody.toString();
+    } else if (opts.jsonBody !== undefined) {
+      headers["Content-Type"] = "application/json";
+      init.body = JSON.stringify(opts.jsonBody);
+    }
+    init.headers = headers;
+    return init;
+  }
+
+  private async assertNotError(res: Response): Promise<void> {
+    if (res.ok) return;
+    // OAuth RFC 6749 §5.2 protocol errors
+    if (res.status === 400 || res.status === 401) {
+      const data = (await res.json().catch(() => undefined)) as
+        | { error?: string; error_description?: string }
+        | undefined;
+      if (data && typeof data === "object" && typeof data.error === "string") {
+        throw new UaePassOAuthError(
+          classifyOAuthError(data.error),
+          data.error,
+          data.error_description,
+          res.status,
+        );
+      }
+    }
+    const body = await res.text().catch(() => "");
+    throw new UaePassHttpError(
+      res.status,
+      `${this.baseUrl} → HTTP ${res.status}`,
+      body,
+    );
+  }
+}
+
+// ─────────── module-level pure helpers ───────────
+
+function appendQuery(
   baseUrl: string,
   query?: Record<string, string | undefined>,
 ): string {
@@ -51,7 +188,8 @@ export function buildUrl(
   for (const [k, v] of Object.entries(query)) {
     if (v !== undefined && v !== null) usp.set(k, v);
   }
-  return `${baseUrl}?${usp.toString()}`;
+  const sep = baseUrl.includes("?") ? "&" : "?";
+  return `${baseUrl}${sep}${usp.toString()}`;
 }
 
 /** Convert a record into a `URLSearchParams` (URL-encoded, no nulls). */
@@ -65,48 +203,97 @@ export function toFormParams(
   return usp;
 }
 
-/** Convenience: encode `client_id:client_secret` per RFC 6749 §2.3.1. */
-export function basicAuthHeader(clientId: string, clientSecret: string): string {
-  return btoaUTF8(`${clientId}:${clientSecret}`);
+/** Encode `clientId:clientSecret` for HTTP Basic auth (RFC 6749 §2.3.1). */
+export function basicAuthHeader(
+  clientId: string,
+  clientSecret: string,
+): string {
+  const bin = new TextEncoder().encode(`${clientId}:${clientSecret}`);
+  let str = "";
+  for (let i = 0; i < bin.byteLength; i++) str += String.fromCharCode(bin[i] ?? 0);
+  return base64EncodeFromBytes(str);
 }
 
-/** UTF-8 → base64 (standard). Works in Node (Buffer) and browsers (btoa). */
-export function btoaUTF8(s: string): string {
-  const bytes = new TextEncoder().encode(s);
-  let bin = "";
-  for (let i = 0; i < bytes.byteLength; i++) bin += String.fromCharCode(bytes[i] ?? 0);
-  if (typeof btoa === "function") return btoa(bin);
-  // Node fallback
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-var-requires
-  const Buf: any = (globalThis as any).Buffer;
-  if (Buf) return Buf.from(bin, "binary").toString("base64");
-  throw new Error("No base64 encoder available in this runtime.");
+// Pure-JS base64, no Buffer dependency — see crypto.ts for rationale.
+const BASE64_ALPHABET =
+  "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+function base64EncodeFromBytes(bin: string): string {
+  const bytes = new TextEncoder().encode(bin);
+  let out = "";
+  for (let i = 0; i < bytes.byteLength; i += 3) {
+    const b1 = bytes[i] ?? 0;
+    const b2 = i + 1 < bytes.byteLength ? (bytes[i + 1] ?? 0) : 0;
+    const b3 = i + 2 < bytes.byteLength ? (bytes[i + 2] ?? 0) : 0;
+    const t = (b1 << 16) | (b2 << 8) | b3;
+    out += BASE64_ALPHABET[(t >> 18) & 0x3f] as string;
+    out += BASE64_ALPHABET[(t >> 12) & 0x3f] as string;
+    out += i + 1 < bytes.byteLength
+      ? (BASE64_ALPHABET[(t >> 6) & 0x3f] as string)
+      : "=";
+    out += i + 2 < bytes.byteLength ? (BASE64_ALPHABET[t & 0x3f] as string) : "=";
+  }
+  return out;
 }
 
-/** Helpful narrowing — proves the SDK only emits known access-token shapes. */
-export function asAccessTokenResponse(v: unknown): AccessTokenResponse {
-  if (!v || typeof v !== "object" || !("access_token" in v)) {
+async function readJsonOrThrow(res: Response, baseUrl: string): Promise<unknown> {
+  try {
+    return await res.json();
+  } catch {
     throw new UaePassError(
       "invalid_response",
-      "Expected an access-token response from UAE PASS",
+      `${baseUrl} responded with non-JSON body where JSON was expected`,
     );
   }
-  return v as AccessTokenResponse;
 }
 
-type OAuthErrorCode =
-  | "invalid_request"
-  | "invalid_client"
-  | "invalid_grant"
-  | "unauthorized_client"
-  | "unsupported_grant_type"
-  | "invalid_scope"
-  | "access_denied"
-  | "unsupported_response_type"
-  | "server_error"
-  | "temporarily_unavailable";
+function errMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
 
-function classifyOAuthError(code: string): OAuthErrorCode {
+/** Narrow an opaque value into the canonical access-token shape. */
+export function asAccessTokenResponse(v: unknown): AccessTokenResponse {
+  if (!v || typeof v !== "object") {
+    throw new UaePassError("invalid_response", "Empty access-token response");
+  }
+  const r = v as Record<string, unknown>;
+  if (typeof r.access_token !== "string" || r.access_token.length === 0) {
+    throw new UaePassError(
+      "invalid_response",
+      "Access-token response missing `access_token`",
+    );
+  }
+  if (r.token_type !== "Bearer") {
+    throw new UaePassError(
+      "invalid_response",
+      `Expected token_type=Bearer, got ${String(r.token_type)}`,
+    );
+  }
+  if (typeof r.expires_in !== "number" || !Number.isFinite(r.expires_in)) {
+    throw new UaePassError(
+      "invalid_response",
+      "Access-token response missing numeric `expires_in`",
+    );
+  }
+  if (typeof r.scope !== "string") {
+    throw new UaePassError(
+      "invalid_response",
+      "Access-token response missing string `scope`",
+    );
+  }
+  const out: AccessTokenResponse = {
+    access_token: r.access_token,
+    token_type: "Bearer",
+    expires_in: r.expires_in,
+    scope: r.scope,
+  };
+  if (typeof r.refresh_token === "string") out.refresh_token = r.refresh_token;
+  return out;
+}
+
+function classifyOAuthError(
+  code: string,
+): Exclude<UaePassError["code"], "network" | "http_error" | "state_mismatch" | "missing_code" | "configuration_error" | "invalid_response"> {
   switch (code) {
     case "invalid_request":
     case "invalid_client":
@@ -121,173 +308,5 @@ function classifyOAuthError(code: string): OAuthErrorCode {
       return code;
     default:
       return "invalid_request";
-  }
-}
-
-export interface ParsedResponse<T> {
-  status: number;
-  ok: boolean;
-  body: T;
-  raw: Response;
-}
-
-/**
- * Execute a request and return a parsed response — the same shape every
- * variant of request needs. Throws a typed UaePassError on failure.
- */
-export async function executeRequest<T = unknown>(
-  url: string,
-  opts: HttpRequestOptions,
-  fetchFn: FetchFn,
-): Promise<T> {
-  const headers: Record<string, string> = { ...(opts.headers ?? {}) };
-  if (opts.bearer) headers["Authorization"] = `Bearer ${opts.bearer}`;
-  if (opts.basicAuth) headers["Authorization"] = `Basic ${opts.basicAuth}`;
-
-  const init: RequestInit = { method: opts.method ?? "GET", headers };
-  if (opts.signal) init.signal = opts.signal;
-  if (opts.formBody) {
-    headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8";
-    init.body = opts.formBody.toString();
-  } else if (opts.jsonBody !== undefined) {
-    headers["Content-Type"] = "application/json";
-    init.body = JSON.stringify(opts.jsonBody);
-  }
-  init.headers = headers;
-
-  const finalUrl = buildUrl(url, opts.query);
-
-  let res: Response;
-  try {
-    res = await fetchFn(finalUrl, init);
-  } catch (err) {
-    throw new UaePassNetworkError(
-      `Network request to ${finalUrl} failed: ${(err as Error)?.message ?? "unknown error"}`,
-      err,
-    );
-  }
-
-  if (res.ok) {
-    if (res.status === 204) return undefined as T;
-    const ct = res.headers.get("content-type") ?? "";
-    if (ct.includes("application/json")) return (await res.json()) as T;
-    return (await res.text()) as unknown as T;
-  }
-
-  // OAuth RFC 6749 §5.2 protocol errors
-  if (res.status === 400 || res.status === 401) {
-    const data = (await res.json().catch(() => undefined)) as
-      | AccessTokenError
-      | undefined;
-    if (data && typeof data === "object" && "error" in data) {
-      throw new UaePassOAuthError(
-        classifyOAuthError(data.error),
-        data.error ?? "oauth_error",
-        data.error_description,
-        res.status,
-      );
-    }
-  }
-
-  const body = await res.text().catch(() => "");
-  throw new UaePassHttpError(
-    res.status,
-    `UAE PASS request to ${finalUrl} failed with HTTP ${res.status}`,
-    body,
-  );
-}
-
-/**
- * Stream-friendly variant — returns the raw `Response` for callers that
- * need binary payloads (signed PDFs, signatures) without buffering.
- * Throws on network failures but **not** on non-2xx — caller inspects.
- */
-export async function executeRawRequest(
-  url: string,
-  opts: HttpRequestOptions,
-  fetchFn: FetchFn,
-): Promise<Response> {
-  const headers: Record<string, string> = { ...(opts.headers ?? {}) };
-  if (opts.bearer) headers["Authorization"] = `Bearer ${opts.bearer}`;
-  if (opts.basicAuth) headers["Authorization"] = `Basic ${opts.basicAuth}`;
-
-  const init: RequestInit = { method: opts.method ?? "GET", headers };
-  if (opts.signal) init.signal = opts.signal;
-  if (opts.formBody) {
-    headers["Content-Type"] = "application/x-www-form-urlencoded; charset=UTF-8";
-    init.body = opts.formBody.toString();
-  } else if (opts.jsonBody !== undefined) {
-    headers["Content-Type"] = "application/json";
-    init.body = JSON.stringify(opts.jsonBody);
-  }
-  init.headers = headers;
-
-  const finalUrl = buildUrl(url, opts.query);
-
-  try {
-    return await fetchFn(finalUrl, init);
-  } catch (err) {
-    throw new UaePassNetworkError(
-      `Network request to ${finalUrl} failed: ${(err as Error)?.message ?? "unknown error"}`,
-      err,
-    );
-  }
-}
-
-/** Stateful wrapper around `executeRequest` so callers can reuse config. */
-export class HttpClient {
-  constructor(
-    public readonly baseUrl: string,
-    private readonly fetchFn: FetchFn = fetch,
-  ) {}
-
-  request<T>(opts: HttpRequestOptions = {}): Promise<T> {
-    return executeRequest<T>(this.baseUrl, opts, this.fetchFn);
-  }
-
-  requestRaw(opts: HttpRequestOptions = {}): Promise<Response> {
-    return executeRawRequest(this.baseUrl, opts, this.fetchFn);
-  }
-
-  postForm<T>(form: Record<string, string>): Promise<T> {
-    const fd = new FormData();
-    for (const [k, v] of Object.entries(form)) fd.set(k, v);
-    return (async () => {
-      let res: Response;
-      try {
-        res = await this.fetchFn(this.baseUrl, {
-          method: "POST",
-          body: fd as unknown as BodyInit,
-        });
-      } catch (err) {
-        throw new UaePassNetworkError(
-          `Network request to ${this.baseUrl} failed: ${(err as Error)?.message ?? "unknown error"}`,
-          err,
-        );
-      }
-      if (res.ok) {
-        if (res.status === 204) return undefined as T;
-        return (await res.json()) as T;
-      }
-      if (res.status === 400 || res.status === 401) {
-        const data = (await res.json().catch(() => undefined)) as
-          | AccessTokenError
-          | undefined;
-        if (data && typeof data === "object" && "error" in data) {
-          throw new UaePassOAuthError(
-            classifyOAuthError(data.error),
-            data.error ?? "oauth_error",
-            data.error_description,
-            res.status,
-          );
-        }
-      }
-      const body = await res.text().catch(() => "");
-      throw new UaePassHttpError(
-        res.status,
-        `UAE PASS request to ${this.baseUrl} failed with HTTP ${res.status}`,
-        body,
-      );
-    })();
   }
 }
