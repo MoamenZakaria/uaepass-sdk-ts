@@ -197,12 +197,14 @@ export interface SignatureSignerProcessResult {
  * @example
  * ```ts
  * // In-memory example — useful for tests
- * const store: UaePassSessionStore = {
- *   let buf;
- *   load: () => buf ?? null,
- *   save: (_, p) => { buf = p; },
- *   clear: () => { buf = null; },
- * };
+ * const store: UaePassSessionStore = (() => {
+ *   let buf: { state: string; verifier: string } | null = null;
+ *   return {
+ *     load: () => buf,
+ *     save: (_res, p) => { buf = p; },
+ *     clear: () => { buf = null; },
+ *   };
+ * })();
  * ```
  */
 export interface UaePassSessionStore<Req = unknown, Res = unknown> {

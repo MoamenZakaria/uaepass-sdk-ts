@@ -17,8 +17,7 @@
     "types": ["node"],
     "baseUrl": ".",
     "paths": {
-      "@uaepass/sdk-ts": ["src/index.ts"],
-      "@uaepass/sdk-ts/express": ["src/express.ts"]
+      "@uaepass/sdk-ts": ["src/index.ts"]
     }
   },
   "include": ["src/**/*.ts", "sample/**/*.ts", "tests/**/*.ts"],

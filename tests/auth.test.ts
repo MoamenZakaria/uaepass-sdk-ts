@@ -31,6 +31,7 @@ import {
   UaePassStateError,
   UaePassError,
   isUaePassError,
+  asAccessTokenResponse,
 } from "../src/index.js";
 
 // ─────────── helpers ───────────
@@ -299,6 +300,23 @@ describe("UaePassClient.exchangeCodeForToken", () => {
     await expect(
       up.exchangeCodeForToken({ code: "c", codeVerifier: "" }),
     ).rejects.toThrow(UaePassConfigurationError);
+  });
+
+  it("validates the access-token response shape (asAccessTokenResponse wired)", async () => {
+    const up = new UaePassClient({
+      ...baseCfg,
+      fetch: fixedFetchMock(() =>
+        // Missing `expires_in` and `scope` — should be rejected by the
+        // wired validator, not silently accepted by the generic JSON cast.
+        makeResponse({ access_token: "tok", token_type: "Bearer" }),
+      ),
+    });
+    await expect(
+      up.exchangeCodeForToken({
+        code: "c",
+        codeVerifier: "v".padEnd(64, "x"),
+      }),
+    ).rejects.toMatchObject({ name: "UaePassError", code: "invalid_response" });
   });
 });
 

@@ -21,6 +21,7 @@
 
 import {
   HttpClient,
+  asAccessTokenResponse,
   basicAuthHeader,
   toFormParams,
   type FetchFn,
@@ -233,18 +234,20 @@ export class UaePassClient {
 
     if (args.multipart) {
       // Single multipart POST — no duplicate calls.
-      return this.tokenHttp.postMultipart<AccessTokenResponse>(
+      const raw = await this.tokenHttp.postMultipart<unknown>(
         { ...fields },
         { signal: args.signal, basicAuth: basic },
       );
+      return asAccessTokenResponse(raw);
     }
     const usp = toFormParams(fields);
-    return this.tokenHttp.request<AccessTokenResponse>({
+    const raw = await this.tokenHttp.request<unknown>({
       method: "POST",
       signal: args.signal,
       formBody: usp,
       basicAuth: basic,
     });
+    return asAccessTokenResponse(raw);
   }
 
   /** Fetch the authenticated user's profile. */

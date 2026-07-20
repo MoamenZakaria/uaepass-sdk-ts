@@ -44,6 +44,7 @@ export {
   type HttpRequestOptions,
   toFormParams,
   basicAuthHeader,
+  asAccessTokenResponse,
 } from "./http.js";
 
 export type {

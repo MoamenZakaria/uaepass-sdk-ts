@@ -14,6 +14,7 @@
 
 import {
   HttpClient,
+  asAccessTokenResponse,
   basicAuthHeader,
   toFormParams,
   type FetchFn,
@@ -117,11 +118,13 @@ export class SignatureClient {
       return this.cached.token;
     }
     const usp = toFormParams({ grant_type: "client_credentials", scope });
-    const fresh = await this.tokenHttp.request<SignatureSigningAccessToken>({
-      method: "POST",
-      formBody: usp,
-      basicAuth: basicAuthHeader(this.clientId, this.clientSecret),
-    });
+    const fresh = asAccessTokenResponse(
+      await this.tokenHttp.request<unknown>({
+        method: "POST",
+        formBody: usp,
+        basicAuth: basicAuthHeader(this.clientId, this.clientSecret),
+      }),
+    );
     if (
       typeof fresh.expires_in !== "number" ||
       !Number.isFinite(fresh.expires_in)
@@ -131,10 +134,10 @@ export class SignatureClient {
       );
     }
     this.cached = {
-      token: fresh,
+      token: fresh as unknown as SignatureSigningAccessToken,
       expiresAtMs: now + fresh.expires_in * 1000,
     };
-    return fresh;
+    return fresh as unknown as SignatureSigningAccessToken;
   }
 
   /** Force-refresh on the next call (e.g. after a 401 from the platform). */
@@ -237,7 +240,6 @@ export class SignatureClient {
     } catch (err) {
       // 401 — signing token rejected, force a refresh on next call.
       if (
-        err instanceof UaePassConfigurationError === false &&
         err &&
         typeof err === "object" &&
         "status" in err &&

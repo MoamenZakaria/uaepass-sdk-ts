@@ -154,8 +154,9 @@ export class HttpClient {
 
   private async assertNotError(res: Response): Promise<void> {
     if (res.ok) return;
-    // OAuth RFC 6749 §5.2 protocol errors
-    if (res.status === 400 || res.status === 401) {
+    // OAuth RFC 6749 §5.2 protocol errors — check 400/401/403 (some
+    // implementations also return OAuth-shaped error bodies on 403).
+    if (res.status === 400 || res.status === 401 || res.status === 403) {
       const data = (await res.json().catch(() => undefined)) as
         | { error?: string; error_description?: string }
         | undefined;
@@ -263,7 +264,7 @@ export function asAccessTokenResponse(v: unknown): AccessTokenResponse {
       "Access-token response missing `access_token`",
     );
   }
-  if (r.token_type !== "Bearer") {
+  if (typeof r.token_type !== "string" || r.token_type.toLowerCase() !== "bearer") {
     throw new UaePassError(
       "invalid_response",
       `Expected token_type=Bearer, got ${String(r.token_type)}`,

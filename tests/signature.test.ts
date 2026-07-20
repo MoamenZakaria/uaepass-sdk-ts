@@ -108,16 +108,16 @@ describe("SignatureClient.getToken", () => {
     expect(tokenCalls).toBe(2);
   });
 
-  it("throws UaePassConfigurationError when expires_in missing", async () => {
+  it("throws when expires_in missing", async () => {
     const fm = fixedFetch((url) =>
       url.includes("trustedx-authserver")
         ? makeResponse({ access_token: "x", token_type: "Bearer", scope: "s" })
         : makeResponse({}),
     );
     const sig = new SignatureClient({ ...baseCfg, fetch: fm });
-    await expect(sig.getToken()).rejects.toBeInstanceOf(
-      UaePassConfigurationError,
-    );
+    await expect(sig.getToken()).rejects.toMatchObject({
+      code: "invalid_response",
+    });
   });
 
   it("invalidateToken forces re-fetch", async () => {
@@ -129,6 +129,7 @@ describe("SignatureClient.getToken", () => {
           access_token: `t-${tokenCalls}`,
           token_type: "Bearer",
           expires_in: 3600,
+          scope: "sig",
         });
       }
       return makeResponse({});
@@ -153,6 +154,7 @@ describe("SignatureClient.createSignerProcess", () => {
           access_token: "sig",
           token_type: "Bearer",
           expires_in: 3600,
+          scope: "sig",
         });
       }
       if (typeof init.body === "string") lastBody = JSON.parse(init.body);
@@ -181,7 +183,12 @@ describe("SignatureClient.createSignerProcess", () => {
 
   it("validates that userAccessToken is provided", async () => {
     const fm = fixedFetch(() =>
-      makeResponse({ access_token: "x", token_type: "Bearer", expires_in: 1 }),
+      makeResponse({
+        access_token: "x",
+        token_type: "Bearer",
+        expires_in: 1,
+        scope: "sig",
+      }),
     );
     const sig = new SignatureClient({ ...baseCfg, fetch: fm });
     await expect(
@@ -191,7 +198,12 @@ describe("SignatureClient.createSignerProcess", () => {
 
   it("validates document.content", async () => {
     const fm = fixedFetch(() =>
-      makeResponse({ access_token: "x", token_type: "Bearer", expires_in: 1 }),
+      makeResponse({
+        access_token: "x",
+        token_type: "Bearer",
+        expires_in: 1,
+        scope: "sig",
+      }),
     );
     const sig = new SignatureClient({ ...baseCfg, fetch: fm });
     await expect(
@@ -222,6 +234,7 @@ describe("SignatureClient.waitUntilDone", () => {
           access_token: "sig",
           token_type: "Bearer",
           expires_in: 3600,
+          scope: "sig",
         });
       }
       return makeResponse(results[i++ % results.length]);
@@ -244,6 +257,7 @@ describe("SignatureClient.waitUntilDone", () => {
           access_token: "sig",
           token_type: "Bearer",
           expires_in: 3600,
+          scope: "sig",
         });
       }
       return makeResponse({ status: "PENDING" });
@@ -281,6 +295,7 @@ describe("SignatureClient.fetchSignedDocument", () => {
           access_token: "sig",
           token_type: "Bearer",
           expires_in: 3600,
+          scope: "sig",
         });
       }
       return makeResponse("server boom", 500, "text/plain");
@@ -300,6 +315,7 @@ describe("SignatureClient.fetchSignedDocument", () => {
           access_token: "sig",
           token_type: "Bearer",
           expires_in: 3600,
+          scope: "sig",
         });
       }
       return {
